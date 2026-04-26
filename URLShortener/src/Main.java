@@ -1,33 +1,57 @@
-import java.util.HashMap;
-import java.util.Map;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
+/* =======================
+   ENTITY
+======================= */
+class UrlMapping {
+    final String shortCode;
+    final String longUrl;
+    final long createdAt;
+    final long expiryAt;
+
+    UrlMapping(String shortCode, String longUrl, long expiryAt) {
+        this.shortCode = shortCode;
+        this.longUrl = longUrl;
+        this.createdAt = System.currentTimeMillis();
+        this.expiryAt = expiryAt;
+    }
+
+    boolean isExpired() {
+        return expiryAt > 0 && System.currentTimeMillis() > expiryAt;
+    }
+}
+
+/* =======================
+   CODE GENERATOR
+======================= */
 interface CodeGenerator {
-    String generate(String url);
+    String generate();
 }
 
 class Base62Generator implements CodeGenerator {
     private static final String CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private final AtomicLong counter;
 
-    Base62Generator(long start) {
+    public Base62Generator(long start) {
         this.counter = new AtomicLong(start);
     }
 
-    Base62Generator() {
-        this(100000L);
+    public Base62Generator() {
+        this(100000);
     }
 
     @Override
-    public String generate(String url) {
-        long num = counter.incrementAndGet();
-        return encode(num);
+    public String generate() {
+        long id = counter.incrementAndGet();
+        return encode(id);
     }
 
     private String encode(long num) {
-        if(num == 0) return String.valueOf(CHARS.charAt(0));
         StringBuilder sb = new StringBuilder();
-        while(num > 0) {
+        while (num > 0) {
             sb.append(CHARS.charAt((int) (num % 62)));
             num /= 62;
         }
@@ -35,165 +59,229 @@ class Base62Generator implements CodeGenerator {
     }
 }
 
-class ClickStats {
-    final String shortCode;
-    int totalClicks;
-    final long createdAt;
-
-    ClickStats(String shortCode) {
-        this.shortCode = shortCode;
-        this.totalClicks = 0;
-        this.createdAt = System.currentTimeMillis();
-    }
-
-    @Override
-    public String toString() {
-        return "ClickStats(" + shortCode + ", clicks = " + totalClicks + ")";
-    }
-}
-
-class Analytics {
-    private final Map<String, ClickStats> data = new HashMap<>();
-
-    void initTracking(String shortCode) {
-        data.put(shortCode, new ClickStats(shortCode));
-    }
-
-    void recordClick(String shortCode) {
-        ClickStats stats = data.get(shortCode);
-        if(stats != null) {
-            stats.totalClicks++;
-        }
-    }
-
-    ClickStats getStats(String shortCode) {
-        return data.get(shortCode);
-    }
-}
-
+/* =======================
+   STORAGE LAYER
+======================= */
 interface URLStore {
-    void save(String shortCode, String longUrl);
-    String find(String shortCode);
-    String existsByUrl(String longUrl);
+    void save(UrlMapping mapping);
+    UrlMapping find(String shortCode);
+    String findByLongUrl(String longUrl);
 }
 
 class InMemoryStore implements URLStore {
-    private final Map<String, String> shortToLong = new HashMap<>();
-    private final Map<String, String> longToShort = new HashMap<>();
+    private final ConcurrentHashMap<String, UrlMapping> shortToLong = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> longToShort = new ConcurrentHashMap<>();
 
     @Override
-    public void save(String shortCode, String longUrl) {
-        shortToLong.put(shortCode, longUrl);
-        longToShort.put(longUrl, shortCode);
+    public void save(UrlMapping mapping) {
+        shortToLong.put(mapping.shortCode, mapping);
+        longToShort.put(mapping.longUrl, mapping.shortCode);
     }
 
     @Override
-    public String find(String shortCode) {
+    public UrlMapping find(String shortCode) {
         return shortToLong.get(shortCode);
     }
 
     @Override
-    public String existsByUrl(String longUrl) {
+    public String findByLongUrl(String longUrl) {
         return longToShort.get(longUrl);
     }
 }
 
-class URLShortener {
+/* =======================
+   CACHE LAYER
+======================= */
+interface Cache {
+    void put(String key, UrlMapping value);
+    UrlMapping get(String key);
+}
+
+class InMemoryCache implements Cache {
+    private final ConcurrentHashMap<String, UrlMapping> cache = new ConcurrentHashMap<>();
+
+    @Override
+    public void put(String key, UrlMapping value) {
+        cache.put(key, value);
+    }
+
+    @Override
+    public UrlMapping get(String key) {
+        return cache.get(key);
+    }
+}
+
+/* =======================
+   ANALYTICS
+======================= */
+class ClickStats {
+    final String shortCode;
+    final long createdAt;
+    final AtomicLong clicks = new AtomicLong(0);
+
+    ClickStats(String shortCode) {
+        this.shortCode = shortCode;
+        this.createdAt = System.currentTimeMillis();
+    }
+
+    void recordClick() {
+        clicks.incrementAndGet();
+    }
+
+    long getClicks() {
+        return clicks.get();
+    }
+}
+
+class AnalyticsService {
+    private final ConcurrentHashMap<String, ClickStats> stats = new ConcurrentHashMap<>();
+
+    void init(String shortCode) {
+        stats.put(shortCode, new ClickStats(shortCode));
+    }
+
+    void record(String shortCode) {
+        ClickStats cs = stats.get(shortCode);
+        if (cs != null) cs.recordClick();
+    }
+
+    ClickStats getStats(String shortCode) {
+        return stats.get(shortCode);
+    }
+}
+
+/* =======================
+   URL VALIDATOR
+======================= */
+class UrlValidator {
+    public static void validate(String url) {
+        try {
+            new URL(url); // throws if invalid
+        } catch (MalformedURLException e) {
+            throw new IllegalArgumentException("Invalid URL: " + url);
+        }
+    }
+}
+
+/* =======================
+   MAIN SERVICE
+======================= */
+class URLShortenerService {
+
     private final String baseUrl;
     private final CodeGenerator generator;
     private final URLStore store;
-    private final Analytics analytics;
+    private final Cache cache;
+    private final AnalyticsService analytics;
 
-    public URLShortener(String baseUrl, CodeGenerator generator, URLStore store) {
+    public URLShortenerService(String baseUrl,
+                               CodeGenerator generator,
+                               URLStore store,
+                               Cache cache) {
         this.baseUrl = baseUrl;
         this.generator = generator;
         this.store = store;
-        this.analytics = new Analytics();
+        this.cache = cache;
+        this.analytics = new AnalyticsService();
     }
 
-    public URLShortener() {
-        this("https://short.ly/", new Base62Generator(), new InMemoryStore());
+    public URLShortenerService() {
+        this("https://short.ly/",
+                new Base62Generator(),
+                new InMemoryStore(),
+                new InMemoryCache());
     }
 
-    public String shorten(String longUrl) {
-        if(longUrl == null || (!longUrl.startsWith("https://") && !longUrl.startsWith("http://"))) {
-            throw new IllegalArgumentException("Invalid URL");
+    /* =======================
+       SHORTEN
+    ======================= */
+    public String shorten(String longUrl, long ttlMillis) {
+        UrlValidator.validate(longUrl);
+
+        // Check existing
+        String existing = store.findByLongUrl(longUrl);
+        if (existing != null) {
+            return baseUrl + existing;
         }
 
-        String existingUrl = store.existsByUrl(longUrl);
-        if(existingUrl != null) {
-            return baseUrl + existingUrl;
-        }
+        String code;
+        UrlMapping mapping;
 
-        String code = generator.generate(longUrl);
-        analytics.initTracking(code);
-        store.save(code, longUrl);
+        // Collision-safe generation
+        do {
+            code = generator.generate();
+            long expiry = ttlMillis > 0 ? System.currentTimeMillis() + ttlMillis : 0;
+            mapping = new UrlMapping(code, longUrl, expiry);
+        } while (store.find(code) != null);
+
+        store.save(mapping);
+        cache.put(code, mapping);
+        analytics.init(code);
+
         return baseUrl + code;
     }
 
+    /* =======================
+       RESOLVE (HOT PATH)
+    ======================= */
     public String resolve(String shortCode) {
-        String longUrl = store.find(shortCode);
-        if(longUrl != null) {
-            analytics.recordClick(shortCode);
+
+        // 1. Cache
+        UrlMapping mapping = cache.get(shortCode);
+
+        // 2. DB fallback
+        if (mapping == null) {
+            mapping = store.find(shortCode);
+            if (mapping != null) {
+                cache.put(shortCode, mapping);
+            }
         }
-        return longUrl;
+
+        if (mapping == null || mapping.isExpired()) {
+            throw new RuntimeException("URL not found or expired");
+        }
+
+        analytics.record(shortCode);
+        return mapping.longUrl;
     }
 
-    public ClickStats getClickStats(String shortCode) {
+    public ClickStats getStats(String shortCode) {
         return analytics.getStats(shortCode);
     }
 }
 
+/* =======================
+   DEMO
+======================= */
 public class Main {
     public static void main(String[] args) {
-        URLShortener urlShortener = new URLShortener();
 
-        String s1 = urlShortener.shorten("https://example.com/very/long/path/to/resource");
-        String s2 = urlShortener.shorten("https://another.com/example/page/long");
+        URLShortenerService service = new URLShortenerService();
 
-        System.out.println("Shortened URL 1: " + s1);
-        System.out.println("Shortened URL 2: " + s2);
+        String shortUrl1 = service.shorten("https://example.com/very/long/url", 0);
+        String shortUrl2 = service.shorten("https://google.com/search?q=java", 0);
 
-        String s3 = urlShortener.shorten("https://example.com/very/long/path/to/resource");
-        System.out.println("URL same as URL 1: " + s3);
+        System.out.println("Short1: " + shortUrl1);
+        System.out.println("Short2: " + shortUrl2);
 
-        String code1 = s1.replace("https://short.ly/", "");
-        String resolved = urlShortener.resolve(code1);
-        System.out.println("Resolved: " + resolved);
+        String code = shortUrl1.replace("https://short.ly/", "");
 
-        urlShortener.resolve(code1);
-        urlShortener.resolve(code1);
-        ClickStats stats = urlShortener.getClickStats(code1);
-        System.out.println("Stats: " + stats);
+        System.out.println("Resolved: " + service.resolve(code));
+        service.resolve(code);
+        service.resolve(code);
+
+        ClickStats stats = service.getStats(code);
+        System.out.println("Clicks: " + stats.getClicks());
+
+        // Expiry test
+        String expiring = service.shorten("https://expire.com", 1000);
+        String expCode = expiring.replace("https://short.ly/", "");
 
         try {
-            urlShortener.shorten("not-a-url");
+            Thread.sleep(1500);
+            service.resolve(expCode);
+        } catch (Exception e) {
+            System.out.println("Expired as expected");
         }
-        catch (IllegalArgumentException e) {
-            System.out.println("Caught unexpected error: " + e.getMessage());
-        }
-
-        System.out.println("All checks passed");
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
